@@ -1,0 +1,81 @@
+import type { Candle } from './analysis';
+
+export type MarketDataResult = {
+  candles: Candle[];
+  source: string;
+  mode: 'live-provider';
+  freshness: string; // app retrieval timestamp, not the exchange candle date
+  warning?: string;
+  currency: string;
+  symbol: string;
+};
+
+const round = (n: number) => Number(n.toFixed(4));
+const rangeStart = (range: string) => {
+  const d = new Date();
+  d.setUTCHours(0, 0, 0, 0);
+  d.setUTCDate(d.getUTCDate() - (range === '3m' ? 100 : range === '6m' ? 200 : 400));
+  return d.toISOString().slice(0, 10);
+};
+const validCandle = (c: Candle) =>
+  /^\d{4}-\d{2}-\d{2}$/.test(c.date) &&
+  [c.open, c.high, c.low, c.close, c.volume].every(Number.isFinite) &&
+  c.open > 0 && c.high > 0 && c.low > 0 && c.close > 0 && c.high >= c.low;
+
+function parseIndianRows(json: any): Candle[] {
+  // tej-api documents the row fields as date/open/high/low/close/volume.
+  const rows = Array.isArray(json) ? json :
+    Array.isArray(json?.data) ? json.data :
+    Array.isArray(json?.rows) ? json.rows :
+    Array.isArray(json?.results) ? json.results : [];
+  return rows.map((r: any) => ({
+    date: String(r.date ?? r.timestamp ?? '').slice(0, 10),
+    open: Number(r.open), high: Number(r.high), low: Number(r.low),
+    close: Number(r.close), volume: Number(r.volume ?? 0),
+  })).filter(validCandle).sort((a: Candle, b: Candle) => a.date.localeCompare(b.date));
+}
+
+async function getIndianData(symbol: string, range: string): Promise<MarketDataResult> {
+  const isBse = symbol.endsWith('.BSE');
+  const exchange = isBse ? 'bse' : 'nse';
+  const ticker = symbol.replace(/\.(BSE|NSE)$/, '');
+  const url = new URL(`https://api.tejhq.dev/v1/ohlcv/${exchange}/${encodeURIComponent(ticker)}`);
+  url.searchParams.set('from', rangeStart(range));
+  url.searchParams.set('to', new Date().toISOString().slice(0, 10));
+  const response = await fetch(url, { cache: 'no-store', headers: { 'Accept': 'application/json', 'User-Agent': 'MarketMindAI/1.0' }, signal: AbortSignal.timeout(15000) });
+  if (!response.ok) throw new Error(`TejHQ ${exchange.toUpperCase()} EOD provider returned HTTP ${response.status} for ${ticker}.`);
+  const json = await response.json();
+  const candles = parseIndianRows(json);
+  if (!candles.length) throw new Error(`TejHQ returned no valid daily bars for ${ticker} on ${exchange.toUpperCase()}. Check the ticker and provider response.`);
+  const limited = candles.filter(c => c.date >= rangeStart(range));
+  return { candles: limited, source: `TejHQ · ${exchange.toUpperCase()} official-exchange EOD bhavcopy`, mode: 'live-provider', freshness: new Date().toISOString(), currency: 'INR', symbol, warning: 'End-of-day data, not live quotes. TejHQ reports NSE data from 2010 and BSE data from 2024-07-08; latest session data is typically published after market close. Latest observation date is shown separately.' };
+}
+
+async function getUsData(symbol: string, range: string): Promise<MarketDataResult> {
+  // Stooq's downloadable daily CSV is used for US listings; keep symbols explicit to avoid guessing exchange.
+  const ticker = symbol.toLowerCase().endsWith('.us') ? symbol.toLowerCase() : `${symbol.toLowerCase()}.us`;
+  const url = new URL('https://stooq.com/q/d/l/');
+  url.searchParams.set('s', ticker);
+  url.searchParams.set('i', 'd');
+  const response = await fetch(url, { cache: 'no-store', headers: { 'User-Agent': 'MarketMindAI/1.0', 'Accept': 'text/csv,text/plain,*/*' }, signal: AbortSignal.timeout(15000) });
+  if (!response.ok) throw new Error(`Stooq daily-data provider returned HTTP ${response.status} for ${ticker.toUpperCase()}.`);
+  const csv = await response.text();
+  const lines = csv.trim().split(/\r?\n/);
+  if (lines.length < 3 || !/^Date,Open,High,Low,Close,Volume/i.test(lines[0])) {
+    throw new Error(`Stooq returned no daily history for ${symbol}. Confirm this is a supported US ticker (for example AAPL or MSFT).`);
+  }
+  const candles = lines.slice(1).map(line => {
+    const [date, open, high, low, close, volume] = line.split(',');
+    return { date, open: Number(open), high: Number(high), low: Number(low), close: Number(close), volume: Number(volume) };
+  }).filter(validCandle).filter(c => c.date >= rangeStart(range)).sort((a, b) => a.date.localeCompare(b.date));
+  if (!candles.length) throw new Error(`Stooq returned no valid daily bars in the selected ${range} range for ${symbol}.`);
+  return { candles, source: 'Stooq · US equities daily CSV', mode: 'live-provider', freshness: new Date().toISOString(), currency: 'USD', symbol, warning: 'Historical end-of-day data from Stooq, not a live quote. Coverage and availability can vary by ticker; confirm the latest observation date before use.' };
+}
+
+export async function getMarketData(rawSymbol: string, range = '1y'): Promise<MarketDataResult> {
+  const symbol = rawSymbol.trim().toUpperCase().replace(/[^A-Z0-9.^=_-]/g, '').slice(0, 24) || 'AAPL';
+  if (!['3m', '6m', '1y'].includes(range)) throw new Error('Unsupported range. Choose 3m, 6m, or 1y.');
+  // Indian symbols must be explicit: RELIANCE.NSE or RELIANCE.BSE. Plain tickers route to the US provider.
+  if (/\.(NSE|BSE)$/.test(symbol)) return getIndianData(symbol, range);
+  return getUsData(symbol, range);
+}
